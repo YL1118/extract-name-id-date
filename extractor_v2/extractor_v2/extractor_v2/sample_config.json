@@ -1,0 +1,28 @@
+{
+  "grouping": {
+    "anchor_order": [
+      "id_no",
+      "name"
+    ],
+    "window_lines_up": 1,
+    "window_lines_down": 3,
+    "max_col_delta": 30,
+    "max_span_lines_for_linking": 3,
+    "pairing_strategy": "greedy",
+    "cluster_merge_if_overlap": true
+  },
+  "scopes": {
+    "ref_date": {
+      "header_top_n": 8,
+      "default": "auto"
+    },
+    "batch_id": {
+      "header_top_n": 8,
+      "default": "auto"
+    }
+  },
+  "dedupe": {
+    "merge_same_id": true,
+    "prefer_higher_confidence": true
+  }
+}
