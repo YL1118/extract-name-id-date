@@ -1,0 +1,50 @@
+class Extractor:
+    def __init__(self, config):
+        self.cfg = config
+        self.logs = []
+        # ---- load surnames ----
+        self.surnames_single = set()
+        self.surnames_double = set()
+        names_cfg = self.cfg.get("names", {})
+        path = names_cfg.get("surname_lexicon_path")
+        if path:
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    for line in f:
+                        s = line.strip()
+                        if not s or s.startswith("#"): 
+                            continue
+                        if len(s) == 1:
+                            self.surnames_single.add(s)
+                        elif len(s) == 2:
+                            self.surnames_double.add(s)
+                        else:
+                            # 其他長度先忽略；如需三字姓可在此擴充
+                            pass
+                self.logs.append(f"surnames_loaded: single={len(self.surnames_single)} double={len(self.surnames_double)}")
+            except FileNotFoundError:
+                self.logs.append(f"surnames_file_missing: {path}")
+
+
+# candidates: name (Chinese 2-4)
+for col, val in iter_name_candidates(line):
+    fmt = 0.6
+    # --- surname-aware adjust/ filter ---
+    if self.surnames_single or self.surnames_double:
+        mode = self.cfg.get("names", {}).get("surname_mode", "soft")
+        bonus = float(self.cfg.get("names", {}).get("bonus_if_surname", 0.3))
+        penalty = float(self.cfg.get("names", {}).get("penalty_if_not", 0.2))
+        hits_double = val[:2] in self.surnames_double
+        hits_single = val[:1] in self.surnames_single
+        if hits_double or hits_single:
+            fmt = min(1.0, fmt + bonus)
+            self.logs.append(f"surname_match:+ line={i} col={col} name={val} double={hits_double}")
+        else:
+            if mode == "hard":
+                self.logs.append(f"surname_filter_drop line={i} col={col} name={val}")
+                continue
+            else:
+                fmt = max(0.2, fmt - penalty)
+    nodes.append(Node(nid, "candidate", "name", i, col, val, val, format_confidence=fmt))
+    self.logs.append(f"cand:name:#{nid} line={i} col={col} raw={val} fmt={fmt}")
+    nid += 1
