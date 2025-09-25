@@ -3,9 +3,10 @@
 """
 Rule-based multi-record extractor for TXT documents (Taiwanese admin-style docs)
 
-新增功能
+新增功能（本版）
 - 每筆紀錄輸出「姓名 Top-5 候選」（records[i].name_top5）
 - 動態雙姓：若偵測到「兩個姓氏字元相鄰」，視為雙姓，後取兩字為名 → 共四字
+- 姓名評分納入「與身分證標籤的距離」：越近越加分（可用常數調整影響力）
 - 仍保留自動挑選的單一最佳姓名於 records[i].name.value
 - 其他欄位與行為向下相容
 
@@ -58,8 +59,10 @@ NAME_BLACKLIST_NEAR = {"公司","單位","科","處","部","電話","分機","�
 HONORIFICS = {"先生","小姐","女士","太太","老師","主管","經理","博士"}
 BIGRAM_BLACKLIST = {"應於","基準","查詢","調查","名單","身分","證號","統編","日期","時間","銀行","公司","單位","地址","電話"}
 
-# 扩充規則：開啟「兩個姓氏相鄰 → 視為雙姓」的動態檢測
-ENABLE_DYNAMIC_DOUBLE_SURNAME = True
+# 擴充規則
+ENABLE_DYNAMIC_DOUBLE_SURNAME = True  # 兩個單姓相鄰 → 視為雙姓
+ENABLE_IDLABEL_PROXIMITY = True       # 姓名距離身分證標籤越近越加分
+IDLABEL_BONUS_SCALE = 1.0             # 與 id 標籤距離分數的縮放（0~1 → 0~1*scale）
 
 # Batch ID
 RE_BATCH_13 = re.compile(r"\b\d{13}\b")
@@ -268,9 +271,8 @@ def name_candidates_from_text(line_text: str, surname_singles: Set[str], surname
     """
     回傳 (name, col) 候選：
     1) 先嘗試「已知雙姓」；成功 → 後取兩字為名（共四字）
-    2) 新增：若 ENABLE_DYNAMIC_DOUBLE_SURNAME 且連續兩字皆在單姓表 → 視為雙姓；後取兩字為名（共四字）
+    2) 若 ENABLE_DYNAMIC_DOUBLE_SURNAME 且連續兩字皆在單姓表 → 視為雙姓；後取兩字為名（共四字）
     3) 否則單姓；後取兩字為名（共三字）
-    注意：為避免漏抓，姓名總長不再硬限制 2~4，只以上述規則擷取。
     """
     cands: List[Tuple[str,int]] = []
     text = line_text
@@ -313,14 +315,12 @@ def name_candidates_from_text(line_text: str, surname_singles: Set[str], surname
 
         ch = text[i]
 
-        # 2) 新增：動態雙姓偵測（兩個單姓相鄰）
+        # 2) 動態雙姓偵測
         if ENABLE_DYNAMIC_DOUBLE_SURNAME and i + 1 < n:
             ch2 = text[i+1]
-            # 兩字皆在單姓表（避免把任意兩個 CJK 誤當雙姓）
             if ch in surname_singles and ch2 in surname_singles:
                 given, col = next_two_cjk_after(i + 2)
                 if given and given not in BIGRAM_BLACKLIST:
-                    # 雙姓 + 兩字名 → 4 字
                     cands.append((ch + ch2 + given, i))
                 matched = True
         if matched:
@@ -434,7 +434,7 @@ def find_field_candidates_around_label(field: str, label: LabelHit, lines: List[
                 for m in pat.finditer(tgt):
                     iso = parse_iso_date(m.group(0))
                     if iso:
-                        add_candidate(iso, m.start(), tgt_line_idx, "below", 1.0)
+                        add_candidate(iso, m.start(), tgt_line_idx, 1.0)
         elif field == "batch_id":
             for m in RE_BATCH_13.finditer(tgt):
                 add_candidate(m.group(0), m.start(), tgt_line_idx, "below", 0.9)
@@ -451,6 +451,9 @@ def pick_best_candidate(cands: List[Candidate]) -> Optional[Candidate]:
 # Record grouping / anchor logic
 # ==============================
 def group_records(all_cands: Dict[str, List[Candidate]]) -> List[Record]:
+    """Greedy grouping using ID as anchor. If no IDs, fall back to name anchors.
+    這裡同時會為「姓名」取鄰近 Top-5 候選，用於輸出。
+    """
     records: List[Record] = []
 
     def nearest(field: str, anchor: Candidate) -> Optional[Candidate]:
@@ -595,17 +598,20 @@ def extract_from_text(text: str, surname_txt_path: Optional[str] = None) -> Dict
     lines = normalize_text(text)
     surname_singles, surname_doubles = load_surnames_from_txt(surname_txt_path) if surname_txt_path else (set(), set(DEFAULT_DOUBLE_SURNAMES))
 
+    # 1) 找標籤
     label_hits = find_label_hits(lines, LABELS, max_edit=1)
 
     per_field_label_presence = {f: False for f in LABELS}
     for h in label_hits:
         per_field_label_presence[h.field] = True
 
+    # 2) 依標籤產生候選
     all_cands: Dict[str, List[Candidate]] = {"name": [], "id_no": [], "ref_date": [], "batch_id": []}
     for h in label_hits:
         cands = find_field_candidates_around_label(h.field, h, lines, surname_singles, surname_doubles)
         all_cands[h.field].extend(cands)
 
+    # 2.5)（可選）如果沒有姓名標籤而有 ID，從 ID 附近抓姓名
     if not per_field_label_presence["name"] and all_cands["id_no"]:
         for idc in all_cands["id_no"]:
             for dl in range(0, MAX_DOWN_LINES + 1):
@@ -622,8 +628,24 @@ def extract_from_text(text: str, surname_txt_path: Optional[str] = None) -> Dict
                         context_bonus=0.2
                     ))
 
+    # 2.7) 新增：姓名候選加分（距離「身分證標籤」最近者加分）
+    if ENABLE_IDLABEL_PROXIMITY:
+        id_label_positions: List[Tuple[int,int]] = [(h.line, h.col) for h in label_hits if h.field == "id_no"]
+        if id_label_positions:
+            for c in all_cands.get("name", []):
+                # 取與任一 id 標籤的最大距離分數（越近越接近 1）
+                best = 0.0
+                for li, lc in id_label_positions:
+                    line_delta = c.line - li
+                    dscore = distance_score(lc, c.col, line_delta)  # 0~1
+                    if dscore > best:
+                        best = dscore
+                c.context_bonus += IDLABEL_BONUS_SCALE * best  # 進入總分：W_CONTEXT * context_bonus
+
+    # 3) 分組成紀錄（同時計算 name Top-5）
     records = group_records(all_cands)
 
+    # 4) 報告
     report: Dict[str, List[str]] = {"name": [], "id_no": [], "ref_date": [], "batch_id": []}
     for field in ["name", "id_no", "ref_date", "batch_id"]:
         if not per_field_label_presence[field]:
@@ -634,6 +656,7 @@ def extract_from_text(text: str, surname_txt_path: Optional[str] = None) -> Dict
             else:
                 report[field].append(f"找到了標籤與候選（共 {len(all_cands[field])} 條），已根據距離與校驗打分。")
 
+    # 5) 輸出
     output = {
         "records": [
             {
@@ -664,6 +687,8 @@ def extract_from_text(text: str, surname_txt_path: Optional[str] = None) -> Dict
                     "W_PENALTY": W_PENALTY,
                 },
                 "enable_dynamic_double_surname": ENABLE_DYNAMIC_DOUBLE_SURNAME,
+                "enable_idlabel_proximity": ENABLE_IDLABEL_PROXIMITY,
+                "idlabel_bonus_scale": IDLABEL_BONUS_SCALE,
             }
         }
     }
@@ -676,7 +701,7 @@ def extract_from_file(txt_path: str, surname_txt_path: Optional[str]) -> Dict:
 
 def main(argv: List[str]) -> None:
     import argparse
-    ap = argparse.ArgumentParser(description="Rule-based TXT extractor (multi-record) with per-record name Top-5 & dynamic double-surname")
+    ap = argparse.ArgumentParser(description="Rule-based TXT extractor (multi-record) with name Top-5, dynamic double-surname, and ID-label proximity bonus")
     ap.add_argument("txt", help="Input .txt file path")
     ap.add_argument("--surnames", help="Path to comma-separated surnames txt (no newline)", default=None)
     ap.add_argument("--output", "-o", help="Output JSON path (default: stdout)", default=None)
