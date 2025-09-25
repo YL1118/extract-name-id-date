@@ -4,18 +4,10 @@
 Rule-based multi-record extractor for TXT documents (Taiwanese admin-style docs)
 
 新增功能
-- 針對每個錨點（優先以身分證號為錨），列出「姓名 Top-5 候選」：輸出於 records[i].name_top5
+- 每筆紀錄輸出「姓名 Top-5 候選」（records[i].name_top5）
+- 動態雙姓：若偵測到「兩個姓氏字元相鄰」，視為雙姓，後取兩字為名 → 共四字
 - 仍保留自動挑選的單一最佳姓名於 records[i].name.value
 - 其他欄位與行為向下相容
-
-原有功能（節選）
-- 標籤驅動的鄰近搜尋（同列 + 下方多列），距離打分
-- 嚴格驗證：姓名（姓氏表、雙姓、middle-dot）、身分證（本國/外來，含 checksum）、日期（含民國轉 ISO）、13 碼批號
-- 模糊標籤（編輯距離 ≤ 1）抗 OCR 噪音
-- 距離模型：行距權重 × 指數型列距衰減 + 方向先驗
-- 以 ID 為錨點的分組（無 ID 則改用姓名）
-- 清晰的報告：標籤缺失、找到標籤但無有效值等
-- 模組化、可測、常數可調
 
 Python 3.12; standard library only.
 """
@@ -40,7 +32,7 @@ LABELS: Dict[str, List[str]] = {
     "batch_id": ["本次調查名單檔"],
 }
 
-# Direction priors (you may customize per field if desired)
+# Direction priors
 DIRECTION_PRIOR = {
     "same_right": 1.2,
     "same_left": 0.9,
@@ -48,9 +40,9 @@ DIRECTION_PRIOR = {
 }
 
 # Distance model
-MAX_DOWN_LINES = 3  # search up to N lines below the label
-LINE_WEIGHTS = {0: 1.0, 1: 0.7, 2: 0.5, 3: 0.3}  # line distance → base weight
-TAU_COL = 12.0      # column distance scale (in characters)
+MAX_DOWN_LINES = 3
+LINE_WEIGHTS = {0: 1.0, 1: 0.7, 2: 0.5, 3: 0.3}
+TAU_COL = 12.0
 
 # Scoring weights
 W_LABEL = 0.3
@@ -61,22 +53,22 @@ W_CONTEXT = 0.2
 W_PENALTY = 0.8
 
 # Name rules
-NAME_GIVEN_MIN = 1
-NAME_GIVEN_MAX = 3
-NAME_SEPARATORS = "·．• "  # middle-dot variants
-NAME_BLACKLIST_NEAR = {"公司", "單位", "科", "處", "部", "電話", "分機", "地址", "附件", "銀行", "分行", "室", "股", "隊", "路", "段", "號", "樓", "市", "縣", "鄉", "鎮", "村", "里"}
+NAME_SEPARATORS = "·．• "
+NAME_BLACKLIST_NEAR = {"公司","單位","科","處","部","電話","分機","地址","附件","銀行","分行","室","股","隊","路","段","號","樓","市","縣","鄉","鎮","村","里"}
 HONORIFICS = {"先生","小姐","女士","太太","老師","主管","經理","博士"}
-# common non-name bigrams that often appear right after labels; exclude as given-name
 BIGRAM_BLACKLIST = {"應於","基準","查詢","調查","名單","身分","證號","統編","日期","時間","銀行","公司","單位","地址","電話"}
 
-# Batch ID strict binding to label required
+# 扩充規則：開啟「兩個姓氏相鄰 → 視為雙姓」的動態檢測
+ENABLE_DYNAMIC_DOUBLE_SURNAME = True
+
+# Batch ID
 RE_BATCH_13 = re.compile(r"\b\d{13}\b")
 
 # ID patterns
 RE_ID_TW = re.compile(r"^[A-Z][0-9]{9}$")
 RE_ID_ARC = re.compile(r"^[A-Z]{2}[0-9]{8}$")
 
-# Date patterns (strings to search in text; parsing handled separately)
+# Date patterns
 DATE_PATTERNS = [
     re.compile(r"\b\d{4}[./-]\d{1,2}[./-]\d{1,2}\b"),
     re.compile(r"民國\s*\d{2,3}\s*年\s*\d{1,2}\s*月\s*\d{1,2}\s*日"),
@@ -99,9 +91,9 @@ RE_CJK = re.compile(rf"^[{CJK_RANGE}]+$")
 @dataclass
 class LabelHit:
     field: str
-    label_text: str  # canonical label matched to
-    matched: str     # surface string in text
-    distance: int    # edit distance
+    label_text: str
+    matched: str
+    distance: int
     line: int
     col: int
 
@@ -153,19 +145,12 @@ def to_halfwidth(s: str) -> str:
     return unicodedata.normalize("NFKC", s)
 
 def normalize_text(s: str) -> List[str]:
-    """Normalize and split into lines, preserving line breaks.
-    - Halfwidth normalization
-    - Normalize newlines to \n
-    - Collapse spaces per line (not across lines)
-    """
     s = to_halfwidth(s)
     s = s.replace("\r\n", "\n").replace("\r", "\n")
     lines = s.split("\n")
-    # collapse only spaces/tabs/ideographic spaces within each line
     lines = [re.sub(r"[ \t　]+", " ", line) for line in lines]
     return lines
 
-# Simple Levenshtein distance (edit distance)
 def levenshtein(a: str, b: str) -> int:
     if a == b:
         return 0
@@ -178,23 +163,17 @@ def levenshtein(a: str, b: str) -> int:
         cur = [i]
         for j, cb in enumerate(b, start=1):
             cost = 0 if ca == cb else 1
-            cur.append(min(
-                prev[j] + 1,      # deletion
-                cur[j-1] + 1,     # insertion
-                prev[j-1] + cost  # substitution
-            ))
+            cur.append(min(prev[j] + 1, cur[j-1] + 1, prev[j-1] + cost))
         prev = cur
     return prev[-1]
 
 def find_label_hits(lines: List[str], labels: Dict[str, List[str]], max_edit: int = 1) -> List[LabelHit]:
     hits: List[LabelHit] = []
     for li, line in enumerate(lines):
-        # exact substring matches
         for field, labellist in labels.items():
             for lab in labellist:
                 for m in re.finditer(re.escape(lab), line):
                     hits.append(LabelHit(field, lab, lab, 0, li, m.start()))
-        # fuzzy matching by sliding window of up to 6 chars
         tokens = re.finditer(r"[\w\u4e00-\u9fff]{2,6}", line)
         for t in tokens:
             text = t.group(0)
@@ -203,7 +182,6 @@ def find_label_hits(lines: List[str], labels: Dict[str, List[str]], max_edit: in
                     d = levenshtein(text, lab)
                     if 0 < d <= max_edit:
                         hits.append(LabelHit(field, lab, text, d, li, t.start()))
-    # de-duplicate: prefer exact matches over fuzzy at same (line,col)
     uniq: Dict[Tuple[int,int,str], LabelHit] = {}
     for h in hits:
         key = (h.line, h.col, h.field)
@@ -232,7 +210,6 @@ def arc_id_like(code: str) -> bool:
 
 def parse_iso_date(txt: str) -> Optional[str]:
     txt = txt.strip()
-    # yyyy-mm-dd, yyyy/mm/dd, yyyy.mm.dd
     m = re.match(r"^(\d{4})[./-](\d{1,2})[./-](\d{1,2})$", txt)
     if m:
         y, mo, d = map(int, m.groups())
@@ -240,7 +217,6 @@ def parse_iso_date(txt: str) -> Optional[str]:
             return datetime(y, mo, d).strftime("%Y-%m-%d")
         except ValueError:
             return None
-    # yyyy年mm月dd日
     m = re.match(r"^(\d{4})\s*年\s*(\d{1,2})\s*月\s*(\d{1,2})\s*日$", txt)
     if m:
         y, mo, d = map(int, m.groups())
@@ -248,7 +224,6 @@ def parse_iso_date(txt: str) -> Optional[str]:
             return datetime(y, mo, d).strftime("%Y-%m-%d")
         except ValueError:
             return None
-    # 民國YYY年mm月dd日 → +1911
     m = re.match(r"^民國\s*(\d{2,3})\s*年\s*(\d{1,2})\s*月\s*(\d{1,2})\s*日$", txt)
     if m:
         roc, mo, d = map(int, m.groups())
@@ -263,12 +238,6 @@ def is_cjk(s: str) -> bool:
     return RE_CJK.fullmatch(s) is not None
 
 def load_surnames_from_txt(path: str) -> Tuple[Set[str], Set[str]]:
-    """Load surnames from a comma-separated txt with no newline.
-    Returns (single_surnames, double_surnames)
-    - Any 1-char CJK entries → single
-    - Any 2-char CJK entries → double
-    - Ignores others
-    """
     try:
         with open(path, "r", encoding="utf-8") as f:
             content = f.read().strip()
@@ -296,10 +265,12 @@ def distance_score(label_col: int, cand_col: int, line_delta: int, tau: float = 
     return line_w * col_w
 
 def name_candidates_from_text(line_text: str, surname_singles: Set[str], surname_doubles: Set[str]) -> List[Tuple[str, int]]:
-    """Return list of (name, col) candidates using the policy:
-    - Find the nearest surname (double first, then single)
-    - Take the next **two** CJK characters as the given name, skipping separators (space/·/．/•)
-    This avoids missing names when they are glued to other tokens; we no longer require total length 2–4.
+    """
+    回傳 (name, col) 候選：
+    1) 先嘗試「已知雙姓」；成功 → 後取兩字為名（共四字）
+    2) 新增：若 ENABLE_DYNAMIC_DOUBLE_SURNAME 且連續兩字皆在單姓表 → 視為雙姓；後取兩字為名（共四字）
+    3) 否則單姓；後取兩字為名（共三字）
+    注意：為避免漏抓，姓名總長不再硬限制 2~4，只以上述規則擷取。
     """
     cands: List[Tuple[str,int]] = []
     text = line_text
@@ -308,7 +279,6 @@ def name_candidates_from_text(line_text: str, surname_singles: Set[str], surname
 
     def next_two_cjk_after(start: int) -> Tuple[Optional[str], Optional[int]]:
         j = start
-        # skip separators after surname
         while j < n and text[j] in sep_set:
             j += 1
         given = []
@@ -324,35 +294,50 @@ def name_candidates_from_text(line_text: str, surname_singles: Set[str], surname
             return ("".join(given), col)
         return (None, None)
 
-    # scan across the line; prefer double surnames
     doubles_sorted = sorted(surname_doubles, key=len, reverse=True)
-    for i in range(n):
-        # try double surname first
+    i = 0
+    while i < n:
         matched = False
+        # 1) 已知雙姓
         for ds in doubles_sorted:
             L = len(ds)
             if i + L <= n and text[i:i+L] == ds:
                 given, col = next_two_cjk_after(i + L)
-                if given:
-                    if given in BIGRAM_BLACKLIST:
-                        continue
+                if given and given not in BIGRAM_BLACKLIST:
                     cands.append((ds + given, i))
                 matched = True
                 break
         if matched:
+            i += 1
             continue
-        # try single surname
+
         ch = text[i]
+
+        # 2) 新增：動態雙姓偵測（兩個單姓相鄰）
+        if ENABLE_DYNAMIC_DOUBLE_SURNAME and i + 1 < n:
+            ch2 = text[i+1]
+            # 兩字皆在單姓表（避免把任意兩個 CJK 誤當雙姓）
+            if ch in surname_singles and ch2 in surname_singles:
+                given, col = next_two_cjk_after(i + 2)
+                if given and given not in BIGRAM_BLACKLIST:
+                    # 雙姓 + 兩字名 → 4 字
+                    cands.append((ch + ch2 + given, i))
+                matched = True
+        if matched:
+            i += 1
+            continue
+
+        # 3) 單姓
         if ch in surname_singles:
             given, col = next_two_cjk_after(i + 1)
-            if given:
-                if given in BIGRAM_BLACKLIST:
-                    continue
+            if given and given not in BIGRAM_BLACKLIST:
                 cands.append((ch + given, i))
+
+        i += 1
+
     return cands
 
 def find_field_candidates_around_label(field: str, label: LabelHit, lines: List[str], surname_singles: Set[str], surname_doubles: Set[str]) -> List[Candidate]:
-    """Generate candidates for a field around a label occurrence."""
     results: List[Candidate] = []
     label_line_text = lines[label.line]
 
@@ -362,7 +347,6 @@ def find_field_candidates_around_label(field: str, label: LabelHit, lines: List[
         dist = distance_score(label.col, vcol, line_delta)
 
         if field == "name":
-            # Hard distance window: enforce proximity
             if line_delta == 0 and col_delta > 14:
                 return
             if line_delta != 0 and col_delta > 10:
@@ -391,7 +375,7 @@ def find_field_candidates_around_label(field: str, label: LabelHit, lines: List[
         )
         results.append(cand)
 
-    # Same line: right side
+    # same line: right
     right_seg = label_line_text[label.col:label.col+60]
     if field == "name":
         for name, c in name_candidates_from_text(right_seg, surname_singles, surname_doubles):
@@ -411,7 +395,7 @@ def find_field_candidates_around_label(field: str, label: LabelHit, lines: List[
         for m in RE_BATCH_13.finditer(right_seg):
             add_candidate(m.group(0), label.col + m.start(), label.line, "same_right", 0.9)
 
-    # Same line: left side
+    # same line: left
     left_seg = label_line_text[max(0, label.col-60):label.col]
     if field == "name":
         for name, c in name_candidates_from_text(left_seg, surname_singles, surname_doubles):
@@ -431,15 +415,14 @@ def find_field_candidates_around_label(field: str, label: LabelHit, lines: List[
         for m in RE_BATCH_13.finditer(left_seg):
             add_candidate(m.group(0), m.start(), label.line, "same_left", 0.9)
 
-    # Below lines
+    # below lines
     for dl in range(1, MAX_DOWN_LINES + 1):
         tgt_line_idx = label.line + dl
         if tgt_line_idx >= len(lines):
             break
         tgt = lines[tgt_line_idx]
         if field == "name":
-            cands = name_candidates_from_text(tgt, surname_singles, surname_doubles)
-            for name, c in cands:
+            for name, c in name_candidates_from_text(tgt, surname_singles, surname_doubles):
                 add_candidate(name, c, tgt_line_idx, "below", 0.8)
         elif field == "id_no":
             for m in re.finditer(r"[A-Z][0-9]{9}|[A-Z]{2}[0-9]{8}", tgt):
@@ -468,19 +451,14 @@ def pick_best_candidate(cands: List[Candidate]) -> Optional[Candidate]:
 # Record grouping / anchor logic
 # ==============================
 def group_records(all_cands: Dict[str, List[Candidate]]) -> List[Record]:
-    """Greedy grouping using ID as anchor. If no IDs, fall back to name anchors.
-    Heuristic: for each anchor, take nearest other-field candidate within line window.
-    這裡同時會為「姓名」取鄰近 Top-5 候選，用於輸出。
-    """
     records: List[Record] = []
 
     def nearest(field: str, anchor: Candidate) -> Optional[Candidate]:
         best = None
         best_s = -1.0
         for c in all_cands.get(field, []):
-            # proximity score centered on anchor
             line_delta = abs(c.line - anchor.line)
-            if line_delta > MAX_DOWN_LINES:  # strict window for grouping
+            if line_delta > MAX_DOWN_LINES:
                 continue
             dist = distance_score(anchor.col, c.col, c.line - anchor.line)
             s = (dist * 3.0) + (0.3 * c.format_conf) + (0.2 * c.dir_prior) - (0.3 * c.penalty)
@@ -511,10 +489,9 @@ def group_records(all_cands: Dict[str, List[Candidate]]) -> List[Record]:
             rec = assemble_record(name_c, a, date_c, batch_c, all_cands, name_topk=name_topk_list)
             records.append(rec)
     else:
-        # fallback: use names as anchors (may create more ambiguous records)
         name_anchors = sorted(all_cands.get("name", []), key=lambda c: (c.line, c.col))
         for a in name_anchors:
-            name_topk_list = nearest_k("name", a, k=5)  # will include itself
+            name_topk_list = nearest_k("name", a, k=5)
             id_c = nearest("id_no", a)
             date_c = nearest("ref_date", a)
             batch_c = nearest("batch_id", a)
@@ -522,7 +499,6 @@ def group_records(all_cands: Dict[str, List[Candidate]]) -> List[Record]:
             records.append(rec)
 
     if not records:
-        # No anchors at all: produce a single empty record with notes
         empty = Record(
             name=FieldResult(None, 0.0, None, ["未偵測到任何姓名候選或身分證號錨點"]),
             id_no=FieldResult(None, 0.0, None, ["未偵測到任何身分證號候選"]),
@@ -530,7 +506,6 @@ def group_records(all_cands: Dict[str, List[Candidate]]) -> List[Record]:
             batch_id=FieldResult(None, 0.0, None, ["未偵測到任何13位名單檔候選"]),
             debug={}
         )
-        # 空紀錄也補一個 name_top5 空列表
         empty.debug["name_top5"] = []
         records.append(empty)
 
@@ -547,7 +522,7 @@ def assemble_record(name_c: Optional[Candidate],
             return FieldResult(None, 0.0, None, fallback_notes)
         return FieldResult(
             value=c.value,
-            confidence=max(0.0, min(1.0, c.score()/3.0)),  # rough normalization for [0,1]
+            confidence=max(0.0, min(1.0, c.score()/3.0)),
             source={
                 "line": c.line,
                 "col": c.col,
@@ -608,12 +583,8 @@ def assemble_record(name_c: Optional[Candidate],
         id_no=field_result_from_cand(id_c, id_notes),
         ref_date=field_result_from_cand(date_c, date_notes),
         batch_id=field_result_from_cand(batch_c, batch_notes),
-        debug={
-            "all_candidates_counts": {k: len(v) for k, v in all_cands.items()},
-        }
+        debug={"all_candidates_counts": {k: len(v) for k, v in all_cands.items()}}
     )
-
-    # 重要：把 Top-5 放到 debug 裡，稍後序列化時提升到 records 第一層
     rec.debug["name_top5"] = pack_topk(name_topk or [])
     return rec
 
@@ -624,24 +595,19 @@ def extract_from_text(text: str, surname_txt_path: Optional[str] = None) -> Dict
     lines = normalize_text(text)
     surname_singles, surname_doubles = load_surnames_from_txt(surname_txt_path) if surname_txt_path else (set(), set(DEFAULT_DOUBLE_SURNAMES))
 
-    # 1) Locate labels (with fuzzy matching)
     label_hits = find_label_hits(lines, LABELS, max_edit=1)
 
-    # Reporting init
     per_field_label_presence = {f: False for f in LABELS}
     for h in label_hits:
         per_field_label_presence[h.field] = True
 
-    # 2) Generate field candidates around labels
     all_cands: Dict[str, List[Candidate]] = {"name": [], "id_no": [], "ref_date": [], "batch_id": []}
     for h in label_hits:
         cands = find_field_candidates_around_label(h.field, h, lines, surname_singles, surname_doubles)
         all_cands[h.field].extend(cands)
 
-    # Anchor assist: If we have IDs but no name label hits, try name search near each ID
     if not per_field_label_presence["name"] and all_cands["id_no"]:
         for idc in all_cands["id_no"]:
-            # scan same line and below lines for names
             for dl in range(0, MAX_DOWN_LINES + 1):
                 li = idc.line + dl
                 if li >= len(lines):
@@ -656,10 +622,8 @@ def extract_from_text(text: str, surname_txt_path: Optional[str] = None) -> Dict
                         context_bonus=0.2
                     ))
 
-    # 3) Group into records（同時計算每筆 name Top-5）
     records = group_records(all_cands)
 
-    # 4) Build global report about labels vs values
     report: Dict[str, List[str]] = {"name": [], "id_no": [], "ref_date": [], "batch_id": []}
     for field in ["name", "id_no", "ref_date", "batch_id"]:
         if not per_field_label_presence[field]:
@@ -670,7 +634,6 @@ def extract_from_text(text: str, surname_txt_path: Optional[str] = None) -> Dict
             else:
                 report[field].append(f"找到了標籤與候選（共 {len(all_cands[field])} 條），已根據距離與校驗打分。")
 
-    # 5) Serialize
     output = {
         "records": [
             {
@@ -678,7 +641,7 @@ def extract_from_text(text: str, surname_txt_path: Optional[str] = None) -> Dict
                 "id_no": asdict(r.id_no),
                 "ref_date": asdict(r.ref_date),
                 "batch_id": asdict(r.batch_id),
-                "name_top5": r.debug.get("name_top5", []),  # 每筆紀錄的姓名前五候選
+                "name_top5": r.debug.get("name_top5", []),
                 "debug": r.debug,
             }
             for r in records
@@ -699,7 +662,8 @@ def extract_from_text(text: str, surname_txt_path: Optional[str] = None) -> Dict
                     "W_DIR": W_DIR,
                     "W_CONTEXT": W_CONTEXT,
                     "W_PENALTY": W_PENALTY,
-                }
+                },
+                "enable_dynamic_double_surname": ENABLE_DYNAMIC_DOUBLE_SURNAME,
             }
         }
     }
@@ -712,7 +676,7 @@ def extract_from_file(txt_path: str, surname_txt_path: Optional[str]) -> Dict:
 
 def main(argv: List[str]) -> None:
     import argparse
-    ap = argparse.ArgumentParser(description="Rule-based TXT extractor (multi-record) with per-record name Top-5")
+    ap = argparse.ArgumentParser(description="Rule-based TXT extractor (multi-record) with per-record name Top-5 & dynamic double-surname")
     ap.add_argument("txt", help="Input .txt file path")
     ap.add_argument("--surnames", help="Path to comma-separated surnames txt (no newline)", default=None)
     ap.add_argument("--output", "-o", help="Output JSON path (default: stdout)", default=None)
