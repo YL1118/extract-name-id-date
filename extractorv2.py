@@ -3,14 +3,12 @@
 """
 Rule-based multi-record extractor for TXT documents (Taiwanese admin-style docs)
 
-新增功能（本版）
+Features (2025-09-25)
 - 每筆紀錄輸出「姓名 Top-5 候選」（records[i].name_top5）
 - 動態雙姓：若偵測到「兩個姓氏字元相鄰」，視為雙姓，後取兩字為名 → 共四字
 - 姓名評分納入「與身分證標籤的距離」：越近越加分（可用常數調整影響力）
-- 仍保留自動挑選的單一最佳姓名於 records[i].name.value
-- 其他欄位與行為向下相容
-
-Python 3.12; standard library only.
+- 新邏輯：即使「有姓名標籤」但附近抓不到姓名候選，也會用「身分證」作錨點補抓姓名
+- 其他欄位與行為向下相容（Python 3.12，僅標準函式庫）
 """
 from __future__ import annotations
 
@@ -60,9 +58,9 @@ HONORIFICS = {"先生","小姐","女士","太太","老師","主管","經理","�
 BIGRAM_BLACKLIST = {"應於","基準","查詢","調查","名單","身分","證號","統編","日期","時間","銀行","公司","單位","地址","電話"}
 
 # 擴充規則
-ENABLE_DYNAMIC_DOUBLE_SURNAME = True  # 兩個單姓相鄰 → 視為雙姓
-ENABLE_IDLABEL_PROXIMITY = True       # 姓名距離身分證標籤越近越加分
-IDLABEL_BONUS_SCALE = 1.0             # 與 id 標籤距離分數的縮放（0~1 → 0~1*scale）
+ENABLE_DYNAMIC_DOUBLE_SURNAME = True   # 兩個單姓相鄰 → 視為雙姓
+ENABLE_IDLABEL_PROXIMITY = True        # 姓名距離身分證標籤越近越加分
+IDLABEL_BONUS_SCALE = 1.0              # 與 id 標籤距離分數的縮放（0~1 → 0~1*scale）
 
 # Batch ID
 RE_BATCH_13 = re.compile(r"\b\d{13}\b")
@@ -434,7 +432,7 @@ def find_field_candidates_around_label(field: str, label: LabelHit, lines: List[
                 for m in pat.finditer(tgt):
                     iso = parse_iso_date(m.group(0))
                     if iso:
-                        add_candidate(iso, m.start(), tgt_line_idx, 1.0)
+                        add_candidate(iso, m.start(), tgt_line_idx, "below", 1.0)  # 修正：dir_key="below"
         elif field == "batch_id":
             for m in RE_BATCH_13.finditer(tgt):
                 add_candidate(m.group(0), m.start(), tgt_line_idx, "below", 0.9)
@@ -611,8 +609,8 @@ def extract_from_text(text: str, surname_txt_path: Optional[str] = None) -> Dict
         cands = find_field_candidates_around_label(h.field, h, lines, surname_singles, surname_doubles)
         all_cands[h.field].extend(cands)
 
-    # 2.5)（可選）如果沒有姓名標籤而有 ID，從 ID 附近抓姓名
-    if not per_field_label_presence["name"] and all_cands["id_no"]:
+    # 2.5) 新邏輯：若「沒有姓名標籤」或「有姓名標籤但抓不到姓名候選」，且有身分證候選 → 用 ID 當錨點補抓姓名
+    if (not per_field_label_presence["name"] or not all_cands["name"]) and all_cands["id_no"]:
         for idc in all_cands["id_no"]:
             for dl in range(0, MAX_DOWN_LINES + 1):
                 li = idc.line + dl
@@ -628,12 +626,11 @@ def extract_from_text(text: str, surname_txt_path: Optional[str] = None) -> Dict
                         context_bonus=0.2
                     ))
 
-    # 2.7) 新增：姓名候選加分（距離「身分證標籤」最近者加分）
+    # 2.7) 姓名候選加分（距離「身分證標籤」越近越加分）
     if ENABLE_IDLABEL_PROXIMITY:
         id_label_positions: List[Tuple[int,int]] = [(h.line, h.col) for h in label_hits if h.field == "id_no"]
         if id_label_positions:
             for c in all_cands.get("name", []):
-                # 取與任一 id 標籤的最大距離分數（越近越接近 1）
                 best = 0.0
                 for li, lc in id_label_positions:
                     line_delta = c.line - li
@@ -701,7 +698,7 @@ def extract_from_file(txt_path: str, surname_txt_path: Optional[str]) -> Dict:
 
 def main(argv: List[str]) -> None:
     import argparse
-    ap = argparse.ArgumentParser(description="Rule-based TXT extractor (multi-record) with name Top-5, dynamic double-surname, and ID-label proximity bonus")
+    ap = argparse.ArgumentParser(description="Rule-based TXT extractor (name Top-5, dynamic double-surname, ID-label proximity, and ID-anchored fallback when name label fails)")
     ap.add_argument("txt", help="Input .txt file path")
     ap.add_argument("--surnames", help="Path to comma-separated surnames txt (no newline)", default=None)
     ap.add_argument("--output", "-o", help="Output JSON path (default: stdout)", default=None)
