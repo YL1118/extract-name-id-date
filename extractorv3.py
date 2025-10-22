@@ -14,6 +14,7 @@ Features
 - spaCy 中文 NER（只取 PERSON）優先作為姓名候選，失敗時回退規則法
 - 新增角色詞黑名單（債務人/債權人/申報人等）與姓名門檻（姓氏開頭、長度/字元檢查）
 - CLI: --no-spacy / --spacy-model / --person-loose
+- 方案A：分組與輸出統一用 Candidate.score()，排序與信心分數完全一致
 """
 from __future__ import annotations
 
@@ -608,30 +609,33 @@ def group_records(all_cands: Dict[str, List[Candidate]]) -> List[Record]:
     """
     records: List[Record] = []
 
+    # ✅ 方案A：分組與輸出統一用 Candidate.score()
     def nearest(field: str, anchor: Candidate) -> Optional[Candidate]:
         best = None
-        best_s = -1.0
+        best_val = -1.0
         for c in all_cands.get(field, []):
             line_delta = abs(c.line - anchor.line)
             if line_delta > MAX_DOWN_LINES:
                 continue
-            dist = distance_score(anchor.col, c.col, c.line - anchor.line)
-            s = (dist * 3.0) + (0.3 * c.format_conf) + (0.2 * c.dir_prior) - (0.3 * c.penalty)
-            if s > best_s:
-                best_s, best = s, c
+            # 仍保留距離門檻（避免過遠候選）
+            if distance_score(anchor.col, c.col, c.line - anchor.line) <= 0.0:
+                continue
+            val = c.score()
+            if val > best_val:
+                best_val, best = val, c
         return best
 
     def nearest_k(field: str, anchor: Candidate, k: int = 5) -> List[Candidate]:
-        scored: List[Tuple[float, Candidate]] = []
+        pool: List[Candidate] = []
         for c in all_cands.get(field, []):
             line_delta = abs(c.line - anchor.line)
             if line_delta > MAX_DOWN_LINES:
                 continue
-            dist = distance_score(anchor.col, c.col, c.line - anchor.line)
-            s = (dist * 3.0) + (0.3 * c.format_conf) + (0.2 * c.dir_prior) - (0.3 * c.penalty)
-            scored.append((s, c))
-        scored.sort(key=lambda x: x[0], reverse=True)
-        return [c for _, c in scored[:k]]
+            if distance_score(anchor.col, c.col, c.line - anchor.line) <= 0.0:
+                continue
+            pool.append(c)
+        pool.sort(key=lambda x: x.score(), reverse=True)
+        return pool[:k]
 
     id_anchors = sorted(all_cands.get("id_no", []), key=lambda c: (c.line, c.col))
 
