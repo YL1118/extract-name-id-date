@@ -3,13 +3,17 @@
 """
 Rule-based multi-record extractor for TXT documents (Taiwanese admin-style docs)
 
-Features (2025-09-25)
+Features
 - 每筆紀錄輸出「姓名 Top-5 候選」（records[i].name_top5）
 - 動態雙姓：若偵測到「兩個姓氏字元相鄰」，視為雙姓，後取兩字為名 → 共四字
 - 姓名評分納入「與身分證標籤的距離」：越近越加分（可用常數調整影響力）
-- 新邏輯：即使「有姓名標籤」但附近抓不到姓名候選，也會用「身分證」作錨點補抓姓名
+- 即使「有姓名標籤」但附近抓不到姓名候選，也會用「身分證」作錨點補抓姓名
 - 其他欄位與行為向下相容（Python 3.12，僅標準函式庫）
-- 2025-10-22：整合 spaCy 中文 NER（只取 PERSON）優先作為姓名候選，失敗時回退規則法
+
+(2025-10-22) 整合更新
+- spaCy 中文 NER（只取 PERSON）優先作為姓名候選，失敗時回退規則法
+- 新增角色詞黑名單（債務人/債權人/申報人等）與姓名門檻（姓氏開頭、長度/字元檢查）
+- CLI: --no-spacy / --spacy-model / --person-loose
 """
 from __future__ import annotations
 
@@ -18,6 +22,7 @@ import json
 import math
 import sys
 import unicodedata
+import string
 from dataclasses import dataclass, asdict
 from datetime import datetime
 from typing import List, Dict, Tuple, Optional, Iterable, Set
@@ -60,14 +65,14 @@ BIGRAM_BLACKLIST = {"應於","基準","查詢","調查","名單","身分","證�
 
 # 擴充規則
 ENABLE_DYNAMIC_DOUBLE_SURNAME = True   # 兩個單姓相鄰 → 視為雙姓
-ENABLE_IDLABEL_PROXIMITY = True        # 姓名距離身分證標籤越近越加分
-IDLABEL_BONUS_SCALE = 1.0              # 與 id 標籤距離分數的縮放（0~1 → 0~1*scale）
+ENABLE_IDLABEL_PROXIMITY    = True     # 姓名距離身分證標籤越近越加分
+IDLABEL_BONUS_SCALE         = 1.0      # 與 id 標籤距離分數的縮放
 
 # Batch ID
 RE_BATCH_13 = re.compile(r"\b\d{13}\b")
 
 # ID patterns
-RE_ID_TW = re.compile(r"^[A-Z][0-9]{9}$")
+RE_ID_TW  = re.compile(r"^[A-Z][0-9]{9}$")
 RE_ID_ARC = re.compile(r"^[A-Z]{2}[0-9]{8}$")
 
 # Date patterns
@@ -91,7 +96,17 @@ RE_CJK = re.compile(rf"^[{CJK_RANGE}]+$")
 # spaCy PERSON integration (optional)
 # ==============================
 USE_SPACY_PERSON = True
-SPACY_ZH_MODEL = "zh_core_web_sm"  # 或 "zh_core_web_trf"（較準確但較慢）
+SPACY_ZH_MODEL   = "zh_core_web_sm"  # 或 "zh_core_web_trf"（較準確但較慢）
+
+# ==============================
+# 姓名過濾強化
+# ==============================
+REQUIRE_SURNAME_PREFIX_FOR_PERSON = True  # True: spaCy PERSON 也必須以姓氏開頭（--person-loose 可放寬）
+ROLE_WORD_BLACKLIST = {
+    "債務人","債權人","申報人","調查人","受文者","陳情人","本人","相對人",
+    "被告","原告","承辦人","戶名","帳戶名","持有人","繳款人","申請人","受益人","收件人"
+}
+LATIN = set(string.ascii_letters)
 
 # ==============================
 # Data structures
@@ -178,10 +193,12 @@ def levenshtein(a: str, b: str) -> int:
 def find_label_hits(lines: List[str], labels: Dict[str, List[str]], max_edit: int = 1) -> List[LabelHit]:
     hits: List[LabelHit] = []
     for li, line in enumerate(lines):
+        # 精確匹配
         for field, labellist in labels.items():
             for lab in labellist:
                 for m in re.finditer(re.escape(lab), line):
                     hits.append(LabelHit(field, lab, lab, 0, li, m.start()))
+        # 模糊（編輯距離 1）
         tokens = re.finditer(r"[\w\u4e00-\u9fff]{2,6}", line)
         for t in tokens:
             text = t.group(0)
@@ -394,8 +411,47 @@ def name_candidates_from_text(line_text: str, surname_singles: Set[str], surname
     return cands
 
 # ==============================
+# 最後一道姓名門檻：黑名單 / 姓氏 / 長度 / 外文名
+# ==============================
+def passes_name_gate(txt: str,
+                     surname_singles: Set[str],
+                     surname_doubles: Set[str],
+                     is_spacy_person: bool) -> bool:
+    t = txt.strip()
+
+    # 角色詞黑名單
+    if t in ROLE_WORD_BLACKLIST:
+        return False
+
+    # 合理長度（中文姓名通常 2–4，放寬到 2–6 容許外文/別名）
+    if not (2 <= len(t) <= 6):
+        return False
+
+    # 外文名容許（含 ·／英文）
+    has_foreign_hint = any(ch in t for ch in "·．• ") or any(ch in LATIN for ch in t)
+
+    # 需要姓氏開頭（雙姓或單姓）
+    starts_with_double = any(t.startswith(ds) for ds in surname_doubles)
+    starts_with_single = (len(t) >= 1 and t[0] in surname_singles)
+
+    if is_spacy_person and REQUIRE_SURNAME_PREFIX_FOR_PERSON:
+        # spaCy PERSON 也要過姓氏門檻，除非是外文名
+        if not (starts_with_double or starts_with_single or has_foreign_hint):
+            return False
+    else:
+        # 規則法也要求（除非外文名）
+        if not (starts_with_double or starts_with_single or has_foreign_hint):
+            return False
+
+    return True
+
+# ==============================
 # Candidate search around labels
 # ==============================
+@dataclass
+class _AddCtx:  # 供內部調試
+    used_any_person: bool = False
+
 def find_field_candidates_around_label(
     field: str,
     label: LabelHit,
@@ -406,6 +462,7 @@ def find_field_candidates_around_label(
 ) -> List[Candidate]:
     results: List[Candidate] = []
     label_line_text = lines[label.line]
+    ctx = _AddCtx()
 
     def add_candidate(value: str, vcol: int, line: int, dir_key: str, fmt_conf: float) -> None:
         line_delta = line - label.line
@@ -444,13 +501,18 @@ def find_field_candidates_around_label(
     # same line: right
     right_seg = label_line_text[label.col:label.col+60]
     if field == "name":
+        used_any = False
         if person_index is not None and label.line in person_index:
             for txt, c in person_index[label.line]:
                 if label.col <= c < label.col + 60:
-                    add_candidate(txt, c, label.line, "same_right", fmt_conf=0.9)
-        else:
+                    if passes_name_gate(txt, surname_singles, surname_doubles, is_spacy_person=True):
+                        add_candidate(txt, c, label.line, "same_right", fmt_conf=0.9)
+                        used_any = True
+                        ctx.used_any_person = True
+        if not used_any:
             for name, c in name_candidates_from_text(right_seg, surname_singles, surname_doubles):
-                add_candidate(name, label.col + c, label.line, "same_right", fmt_conf=0.8)
+                if passes_name_gate(name, surname_singles, surname_doubles, is_spacy_person=False):
+                    add_candidate(name, label.col + c, label.line, "same_right", fmt_conf=0.8)
     elif field == "id_no":
         for m in re.finditer(r"[A-Z][0-9]{9}|[A-Z]{2}[0-9]{8}", right_seg):
             code = m.group(0)
@@ -469,13 +531,18 @@ def find_field_candidates_around_label(
     # same line: left
     left_seg = label_line_text[max(0, label.col-60):label.col]
     if field == "name":
+        used_any = False
         if person_index is not None and label.line in person_index:
             for txt, c in person_index[label.line]:
                 if (label.col - 60) <= c < label.col:
-                    add_candidate(txt, c, label.line, "same_left", fmt_conf=0.9)
-        else:
+                    if passes_name_gate(txt, surname_singles, surname_doubles, is_spacy_person=True):
+                        add_candidate(txt, c, label.line, "same_left", fmt_conf=0.9)
+                        used_any = True
+                        ctx.used_any_person = True
+        if not used_any:
             for name, c in name_candidates_from_text(left_seg, surname_singles, surname_doubles):
-                add_candidate(name, c, label.line, "same_left", fmt_conf=0.8)
+                if passes_name_gate(name, surname_singles, surname_doubles, is_spacy_person=False):
+                    add_candidate(name, c, label.line, "same_left", fmt_conf=0.8)
     elif field == "id_no":
         for m in re.finditer(r"[A-Z][0-9]{9}|[A-Z]{2}[0-9]{8}", left_seg):
             code = m.group(0)
@@ -498,12 +565,17 @@ def find_field_candidates_around_label(
             break
         tgt = lines[tgt_line_idx]
         if field == "name":
+            used_any = False
             if person_index is not None and tgt_line_idx in person_index:
                 for txt, c in person_index[tgt_line_idx]:
-                    add_candidate(txt, c, tgt_line_idx, "below", 0.9)
-            else:
+                    if passes_name_gate(txt, surname_singles, surname_doubles, is_spacy_person=True):
+                        add_candidate(txt, c, tgt_line_idx, "below", 0.9)
+                        used_any = True
+                        ctx.used_any_person = True
+            if not used_any:
                 for name, c in name_candidates_from_text(tgt, surname_singles, surname_doubles):
-                    add_candidate(name, c, tgt_line_idx, "below", 0.8)
+                    if passes_name_gate(name, surname_singles, surname_doubles, is_spacy_person=False):
+                        add_candidate(name, c, tgt_line_idx, "below", 0.8)
         elif field == "id_no":
             for m in re.finditer(r"[A-Z][0-9]{9}|[A-Z]{2}[0-9]{8}", tgt):
                 code = m.group(0)
@@ -649,7 +721,7 @@ def assemble_record(name_c: Optional[Candidate],
         return out
 
     name_notes = [] if name_c else [
-        "找不到與標籤鄰近且符合規則的姓名候選；若身分證存在，已嘗試以ID為錨點向附近搜尋姓名。"
+        "找不到與標籤鄰近且符合規則/NER 的姓名候選；若身分證存在，已嘗試以ID為錨點向附近搜尋姓名。"
     ]
     id_notes = [] if id_c else [
         "找不到與標籤鄰近且符合格式/校驗的身分證號候選（支援本國與外來格式）。"
@@ -701,17 +773,19 @@ def extract_from_text(text: str, surname_txt_path: Optional[str] = None) -> Dict
         )
         all_cands[h.field].extend(cands)
 
-    # 2.5) 新邏輯：若「沒有姓名標籤」或「有姓名標籤但抓不到姓名候選」，且有身分證候選 → 用 ID 當錨點補抓姓名
+    # 2.5) 若「沒有姓名標籤」或「有姓名標籤但抓不到姓名候選」，且有身分證候選 → 用 ID 當錨點補抓姓名
     if (not per_field_label_presence["name"] or not all_cands["name"]) and all_cands["id_no"]:
         for idc in all_cands["id_no"]:
             for dl in range(0, MAX_DOWN_LINES + 1):
                 li = idc.line + dl
                 if li >= len(lines):
                     break
-                # 先用 PERSON
                 used_any = False
+                # 先用 PERSON
                 if spacy_person_index.get(li):
                     for txt, col in spacy_person_index[li]:
+                        if not passes_name_gate(txt, surname_singles, surname_doubles, is_spacy_person=True):
+                            continue
                         dist = distance_score(idc.col, col, li - idc.line)
                         all_cands["name"].append(Candidate(
                             field="name", value=txt, line=li, col=col,
@@ -721,9 +795,11 @@ def extract_from_text(text: str, surname_txt_path: Optional[str] = None) -> Dict
                             context_bonus=0.25
                         ))
                         used_any = True
-                # 沒有 PERSON 再退回規則法
+                # 沒有 PERSON 再回退規則法
                 if not used_any:
                     for name, col in name_candidates_from_text(lines[li], surname_singles, surname_doubles):
+                        if not passes_name_gate(name, surname_singles, surname_doubles, is_spacy_person=False):
+                            continue
                         dist = distance_score(idc.col, col, li - idc.line)
                         all_cands["name"].append(Candidate(
                             field="name", value=name, line=li, col=col,
@@ -744,7 +820,7 @@ def extract_from_text(text: str, surname_txt_path: Optional[str] = None) -> Dict
                     dscore = distance_score(lc, c.col, line_delta)  # 0~1
                     if dscore > best:
                         best = dscore
-                c.context_bonus += IDLABEL_BONUS_SCALE * best  # 進入總分：W_CONTEXT * context_bonus
+                c.context_bonus += IDLABEL_BONUS_SCALE * best  # 進入總分
 
     # 3) 分組成紀錄（同時計算 name Top-5）
     records = group_records(all_cands)
@@ -796,6 +872,8 @@ def extract_from_text(text: str, surname_txt_path: Optional[str] = None) -> Dict
                 "idlabel_bonus_scale": IDLABEL_BONUS_SCALE,
                 "use_spacy_person": USE_SPACY_PERSON,
                 "spacy_zh_model": SPACY_ZH_MODEL,
+                "require_surname_prefix_for_person": REQUIRE_SURNAME_PREFIX_FOR_PERSON,
+                "role_word_blacklist_count": len(ROLE_WORD_BLACKLIST),
             }
         }
     }
@@ -808,20 +886,26 @@ def extract_from_file(txt_path: str, surname_txt_path: Optional[str]) -> Dict:
 
 def main(argv: List[str]) -> None:
     import argparse
-    ap = argparse.ArgumentParser(description="Rule-based TXT extractor (name Top-5, dynamic double-surname, ID-label proximity, spaCy PERSON priority, and ID-anchored fallback when name label fails)")
+    ap = argparse.ArgumentParser(
+        description="Rule-based TXT extractor (name Top-5, dynamic double-surname, ID-label proximity, spaCy PERSON priority, name gate with role blacklist, and ID-anchored fallback)"
+    )
     ap.add_argument("txt", help="Input .txt file path")
     ap.add_argument("--surnames", help="Path to comma-separated surnames txt (no newline)", default=None)
     ap.add_argument("--output", "-o", help="Output JSON path (default: stdout)", default=None)
     ap.add_argument("--no-spacy", action="store_true", help="Disable spaCy PERSON and use pure rule-based name extraction")
     ap.add_argument("--spacy-model", default=None, help="Override spaCy zh model name (e.g., zh_core_web_sm / zh_core_web_trf)")
+    ap.add_argument("--person-loose", action="store_true",
+                    help="Allow spaCy PERSON not starting with a Chinese surname (friendlier to foreign/rare names)")
     args = ap.parse_args(argv)
 
     # 動態覆寫設定（不破壞全域預設）
-    global USE_SPACY_PERSON, SPACY_ZH_MODEL
+    global USE_SPACY_PERSON, SPACY_ZH_MODEL, REQUIRE_SURNAME_PREFIX_FOR_PERSON
     if args.no_spacy:
         USE_SPACY_PERSON = False
     if args.spacy_model:
         SPACY_ZH_MODEL = args.spacy_model
+    if args.person_loose:
+        REQUIRE_SURNAME_PREFIX_FOR_PERSON = False
 
     result = extract_from_file(args.txt, args.surnames)
     js = json.dumps(result, ensure_ascii=False, indent=2)
