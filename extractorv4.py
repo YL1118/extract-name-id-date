@@ -2,16 +2,18 @@
 # -*- coding: utf-8 -*-
 """
 Rule-based multi-record extractor for TXT documents (Taiwanese admin-style docs)
-Batch version with minimal output:
-- For each requested field: only (value, confidence, context10)
-- context10 = 10 chars before + matched span + 10 chars after (from normalized text)
-- Batch processing: read all .txt files under a directory
+Unified scoring + Batch + Minimal output
 
-Usage:
+Minimal output per field:
+- value
+- confidence (0~1, rounded to 4 decimals)
+- context10 (前後各10字 from normalized text)
+
+CLI:
   # 單檔
   python extractor.py input.txt --surnames surnames.txt
 
-  # 批次資料夾（只會讀 .txt）
+  # 批次資料夾（只讀 .txt）
   python extractor.py --input_dir ./folder --surnames surnames.txt -o out.json
 """
 from __future__ import annotations
@@ -23,12 +25,12 @@ import sys
 import unicodedata
 from dataclasses import dataclass
 from datetime import datetime
-from typing import List, Dict, Tuple, Optional, Iterable, Set
+from typing import List, Dict, Tuple, Optional, Set
 import os
 import glob
 
 # ==============================
-# Configuration (tweak as needed)
+# Configuration
 # ==============================
 LABELS: Dict[str, List[str]] = {
     "name": ["姓名", "調查人", "申報人"],
@@ -45,7 +47,7 @@ MAX_DOWN_LINES = 3
 LINE_WEIGHTS = {0: 1.0, 1: 0.7, 2: 0.5, 3: 0.3}
 TAU_COL = 12.0
 
-# Scoring weights
+# Scoring weights (base internal score)
 W_LABEL = 0.3
 W_FORMAT = 0.9
 W_DIST = 1.6
@@ -55,8 +57,6 @@ W_PENALTY = 0.8
 
 # Name rules
 NAME_SEPARATORS = "·．• "
-NAME_BLACKLIST_NEAR = {"公司","單位","科","處","部","電話","分機","地址","附件","銀行","分行","室","股","隊","路","段","號","樓","市","縣","鄉","鎮","村","里"}
-HONORIFICS = {"先生","小姐","女士","太太","老師","主管","經理","博士"}
 BIGRAM_BLACKLIST = {"應於","基準","查詢","調查","名單","身分","證號","統編","日期","時間","銀行","公司","單位","地址","電話"}
 
 # 擴充規則
@@ -88,6 +88,10 @@ DEFAULT_DOUBLE_SURNAMES = {
 CJK_RANGE = "\u4e00-\u9fff"
 RE_CJK = re.compile(rf"^[{CJK_RANGE}]+$")
 
+# ===== Unified selection parameters =====
+ANCHOR_PROX_WEIGHT = 1.0  # 影響「靠近 anchor」的加分（可調 0~2）
+DIR_RANK = {"same_right": 3, "same_left": 2, "below": 1}  # 決勝方向優先序
+
 # ==============================
 # Data structures
 # ==============================
@@ -117,6 +121,7 @@ class Candidate:
     penalty: float = 0.0
 
     def score(self) -> float:
+        # 核心分數：單一來源
         return (
             W_LABEL * self.label_conf
             + W_FORMAT * self.format_conf
@@ -235,6 +240,9 @@ def distance_score(label_col: int, cand_col: int, line_delta: int, tau: float = 
     col_w = math.exp(-abs(cand_col - label_col)/tau)
     return line_w * col_w
 
+# ==============================
+# Name candidates
+# ==============================
 def name_candidates_from_text(line_text: str, surname_singles: Set[str], surname_doubles: Set[str]) -> List[Tuple[str, int]]:
     cands: List[Tuple[str,int]] = []
     text = line_text
@@ -287,18 +295,19 @@ def name_candidates_from_text(line_text: str, surname_singles: Set[str], surname
                 matched = True
         if matched:
             i += 1
-            continue
-
-        # 單姓
-        if ch in surname_singles:
-            given, col = next_two_cjk_after(i + 1)
-            if given and given not in BIGRAM_BLACKLIST:
-                cands.append((ch + given, i))
-
-        i += 1
+        else:
+            # 單姓
+            if ch in surname_singles:
+                given, col = next_two_cjk_after(i + 1)
+                if given and given not in BIGRAM_BLACKLIST:
+                    cands.append((ch + given, i))
+            i += 1
 
     return cands
 
+# ==============================
+# Candidate discovery
+# ==============================
 def find_field_candidates_around_label(field: str, label: LabelHit, lines: List[str], surname_singles: Set[str], surname_doubles: Set[str]) -> List[Candidate]:
     results: List[Candidate] = []
     label_line_text = lines[label.line]
@@ -317,26 +326,20 @@ def find_field_candidates_around_label(field: str, label: LabelHit, lines: List[
             if dist < 0.2: return
 
         dir_prior = DIRECTION_PRIOR.get(dir_key, 0.0)
-        cand = Candidate(
-            field=field,
-            value=value,
-            line=line,
-            col=vcol,
-            label_line=label.line,
-            label_col=label.col,
+        results.append(Candidate(
+            field=field, value=value, line=line, col=vcol,
+            label_line=label.line, label_col=label.col,
             source_label=label.label_text,
             format_conf=fmt_conf,
             label_conf=1.0 - min(label.distance, 1) * 0.5,
-            dir_prior=dir_prior,
-            dist_score=dist,
-        )
-        results.append(cand)
+            dir_prior=dir_prior, dist_score=dist,
+        ))
 
     # same line: right
     right_seg = label_line_text[label.col:label.col+60]
     if field == "name":
         for name, c in name_candidates_from_text(right_seg, surname_singles, surname_doubles):
-            add_candidate(name, label.col + c, label.line, "same_right", fmt_conf=0.8)
+            add_candidate(name, label.col + c, label.line, "same_right", 0.8)
     elif field == "id_no":
         for m in re.finditer(r"[A-Z][0-9]{9}|[A-Z]{2}[0-9]{8}", right_seg):
             code = m.group(0)
@@ -346,31 +349,30 @@ def find_field_candidates_around_label(field: str, label: LabelHit, lines: List[
         for pat in DATE_PATTERNS:
             for m in pat.finditer(right_seg):
                 iso = parse_iso_date(m.group(0))
-                if iso:
-                    add_candidate(iso, label.col + m.start(), label.line, "same_right", 1.0)
+                if iso: add_candidate(iso, label.col + m.start(), label.line, "same_right", 1.0)
     elif field == "batch_id":
         for m in RE_BATCH_13.finditer(right_seg):
             add_candidate(m.group(0), label.col + m.start(), label.line, "same_right", 0.9)
 
     # same line: left
-    left_seg = label_line_text[max(0, label.col-60):label.col]
+    left_start = max(0, label.col-60)
+    left_seg = label_line_text[left_start:label.col]
     if field == "name":
         for name, c in name_candidates_from_text(left_seg, surname_singles, surname_doubles):
-            add_candidate(name, max(0, label.col-60) + c, label.line, "same_left", fmt_conf=0.8)
+            add_candidate(name, left_start + c, label.line, "same_left", 0.8)
     elif field == "id_no":
         for m in re.finditer(r"[A-Z][0-9]{9}|[A-Z]{2}[0-9]{8}", left_seg):
             code = m.group(0)
             fmt = 1.0 if tw_id_checksum_ok(code) or arc_id_like(code) else 0.5
-            add_candidate(code, max(0, label.col-60) + m.start(), label.line, "same_left", fmt)
+            add_candidate(code, left_start + m.start(), label.line, "same_left", fmt)
     elif field == "ref_date":
         for pat in DATE_PATTERNS:
             for m in pat.finditer(left_seg):
                 iso = parse_iso_date(m.group(0))
-                if iso:
-                    add_candidate(iso, max(0, label.col-60) + m.start(), label.line, "same_left", 1.0)
+                if iso: add_candidate(iso, left_start + m.start(), label.line, "same_left", 1.0)
     elif field == "batch_id":
         for m in RE_BATCH_13.finditer(left_seg):
-            add_candidate(m.group(0), max(0, label.col-60) + m.start(), label.line, "same_left", 0.9)
+            add_candidate(m.group(0), left_start + m.start(), label.line, "same_left", 0.9)
 
     # below lines
     for dl in range(1, MAX_DOWN_LINES + 1):
@@ -389,25 +391,51 @@ def find_field_candidates_around_label(field: str, label: LabelHit, lines: List[
             for pat in DATE_PATTERNS:
                 for m in pat.finditer(tgt):
                     iso = parse_iso_date(m.group(0))
-                    if iso:
-                        add_candidate(iso, m.start(), tgt_line_idx, "below", 1.0)
+                    if iso: add_candidate(iso, m.start(), tgt_line_idx, "below", 1.0)
         elif field == "batch_id":
             for m in RE_BATCH_13.finditer(tgt):
                 add_candidate(m.group(0), m.start(), tgt_line_idx, "below", 0.9)
 
     return results
 
-def pick_best_candidate(cands: List[Candidate]) -> Optional[Candidate]:
+# ==============================
+# Unified selection logic
+# ==============================
+def _dir_of(c: Candidate, anchor: Candidate) -> str:
+    if c.line == anchor.line:
+        return "same_right" if c.col >= anchor.col else "same_left"
+    return "below" if c.line > anchor.line else "above"  # "above" 會在 DIR_RANK 中當 0
+
+def anchor_proximity_score(anchor_col: int, cand_col: int, line_delta: int) -> float:
+    # 與距離函式一致，輸出 0~1
+    return distance_score(anchor_col, cand_col, line_delta)
+
+def final_score(c: Candidate, anchor: Optional[Candidate] = None) -> float:
+    base = c.score()
+    if anchor is None:
+        return base
+    prox = anchor_proximity_score(anchor.col, c.col, c.line - anchor.line)  # 0~1
+    return base + ANCHOR_PROX_WEIGHT * prox
+
+def tie_break_key(c: Candidate, anchor: Optional[Candidate] = None) -> Tuple:
+    if anchor is None:
+        # 無 anchor：偏向上/左、格式佳，以穩定排序
+        return (10**6, 0, 10**6, -c.format_conf, c.line, c.col)
+    dline = abs(c.line - anchor.line)
+    dcol = abs(c.col - anchor.col)
+    dir_score = DIR_RANK.get(_dir_of(c, anchor), 0)
+    return (dline, -dir_score, dcol, -c.format_conf, c.line, c.col)
+
+def pick_best_candidate(cands: List[Candidate], anchor: Optional[Candidate] = None) -> Optional[Candidate]:
     if not cands:
         return None
-    cands_sorted = sorted(cands, key=lambda c: c.score(), reverse=True)
+    cands_sorted = sorted(cands, key=lambda x: (-final_score(x, anchor), tie_break_key(x, anchor)))
     return cands_sorted[0]
 
 # ==============================
-# Context helpers
+# Context helper
 # ==============================
 def get_context10(lines: List[str], line: int, col: int, span_len: int) -> str:
-    """Return 10 chars before + span + 10 chars after from normalized text lines."""
     if line < 0 or line >= len(lines): return ""
     s = lines[line]
     start = max(0, col - 10)
@@ -415,39 +443,23 @@ def get_context10(lines: List[str], line: int, col: int, span_len: int) -> str:
     return s[start:end]
 
 # ==============================
-# Record grouping / anchor logic
+# Grouping (uses unified selection)
 # ==============================
 def group_records(all_cands: Dict[str, List[Candidate]]) -> List[Tuple[Optional[Candidate], Optional[Candidate], Optional[Candidate], Optional[Candidate], List[Candidate]]]:
-    """Return list of tuples: (name_c, id_c, date_c, batch_c, name_top5) using ID as anchor if present."""
     records: List[Tuple[Optional[Candidate], Optional[Candidate], Optional[Candidate], Optional[Candidate], List[Candidate]]] = []
 
     def nearest(field: str, anchor: Candidate) -> Optional[Candidate]:
-        best = None
-        best_s = -1.0
-        for c in all_cands.get(field, []):
-            line_delta = abs(c.line - anchor.line)
-            if line_delta > MAX_DOWN_LINES:
-                continue
-            dist = distance_score(anchor.col, c.col, c.line - anchor.line)
-            s = (dist * 3.0) + (0.3 * c.format_conf) + (0.2 * c.dir_prior) - (0.3 * c.penalty)
-            if s > best_s:
-                best_s, best = s, c
-        return best
+        pool = [c for c in all_cands.get(field, []) if abs(c.line - anchor.line) <= MAX_DOWN_LINES]
+        if not pool: return None
+        pool_sorted = sorted(pool, key=lambda c: (-final_score(c, anchor), tie_break_key(c, anchor)))
+        return pool_sorted[0]
 
     def nearest_k(field: str, anchor: Candidate, k: int = 5) -> List[Candidate]:
-        scored: List[Tuple[float, Candidate]] = []
-        for c in all_cands.get(field, []):
-            line_delta = abs(c.line - anchor.line)
-            if line_delta > MAX_DOWN_LINES:
-                continue
-            dist = distance_score(anchor.col, c.col, c.line - anchor.line)
-            s = (dist * 3.0) + (0.3 * c.format_conf) + (0.2 * c.dir_prior) - (0.3 * c.penalty)
-            scored.append((s, c))
-        scored.sort(key=lambda x: x[0], reverse=True)
-        return [c for _, c in scored[:k]]
+        pool = [c for c in all_cands.get(field, []) if abs(c.line - anchor.line) <= MAX_DOWN_LINES]
+        pool_sorted = sorted(pool, key=lambda c: (-final_score(c, anchor), tie_break_key(c, anchor)))
+        return pool_sorted[:k]
 
     id_anchors = sorted(all_cands.get("id_no", []), key=lambda c: (c.line, c.col))
-
     if id_anchors:
         for a in id_anchors:
             name_topk_list = nearest_k("name", a, k=5)
@@ -466,27 +478,25 @@ def group_records(all_cands: Dict[str, List[Candidate]]) -> List[Tuple[Optional[
 
     if not records:
         records.append((None, None, None, None, []))
-
     return records
 
 # ==============================
-# Main extraction pipeline (returns minimal triples)
+# Extraction (minimal triples)
 # ==============================
 def extract_minimal_from_text(text: str, surname_txt_path: Optional[str] = None) -> Dict:
     lines = normalize_text(text)
     surname_singles, surname_doubles = load_surnames_from_txt(surname_txt_path) if surname_txt_path else (set(), set(DEFAULT_DOUBLE_SURNAMES))
 
-    # 1) 找標籤
+    # 1) 標籤
     label_hits = find_label_hits(lines, LABELS, max_edit=1)
     per_field_label_presence = {f: False for f in LABELS}
     for h in label_hits:
         per_field_label_presence[h.field] = True
 
-    # 2) 依標籤產生候選
+    # 2) 產生候選
     all_cands: Dict[str, List[Candidate]] = {"name": [], "id_no": [], "ref_date": [], "batch_id": []}
     for h in label_hits:
-        cands = find_field_candidates_around_label(h.field, h, lines, surname_singles, surname_doubles)
-        all_cands[h.field].extend(cands)
+        all_cands[h.field].extend(find_field_candidates_around_label(h.field, h, lines, surname_singles, surname_doubles))
 
     # 2.5) 若沒姓名候選但有ID → 用ID附近補抓姓名
     if (not per_field_label_presence["name"] or not all_cands["name"]) and all_cands["id_no"]:
@@ -504,7 +514,7 @@ def extract_minimal_from_text(text: str, surname_txt_path: Optional[str] = None)
                         context_bonus=0.2
                     ))
 
-    # 2.7) 姓名距離身分證標籤加分
+    # 2.7) 姓名距 ID 標籤加分（寫進 context_bonus，仍屬 base score 一部分）
     if ENABLE_IDLABEL_PROXIMITY:
         id_label_positions: List[Tuple[int,int]] = [(h.line, h.col) for h in label_hits if h.field == "id_no"]
         if id_label_positions:
@@ -512,14 +522,13 @@ def extract_minimal_from_text(text: str, surname_txt_path: Optional[str] = None)
                 best = 0.0
                 for li, lc in id_label_positions:
                     dscore = distance_score(lc, c.col, c.line - li)
-                    if dscore > best:
-                        best = dscore
+                    best = max(best, dscore)
                 c.context_bonus += IDLABEL_BONUS_SCALE * best
 
-    # 3) 分組
+    # 3) 分組（統一評分）
     grouped = group_records(all_cands)
 
-    # 4) 只回傳三項：value, confidence, context10
+    # 4) 最小輸出
     def pack_field(c: Optional[Candidate]) -> Dict[str, Optional[str]]:
         if c is None:
             return {"value": None, "confidence": 0.0, "context10": None}
@@ -536,21 +545,18 @@ def extract_minimal_from_text(text: str, surname_txt_path: Optional[str] = None)
             "batch_id": pack_field(batch_c),
         })
 
-    # 5) 報告（可選）：標籤是否存在（保留，方便除錯；你要最精簡也可拿掉）
+    # 可保留簡短報告（若不需要可刪）
     report: Dict[str, List[str]] = {"name": [], "id_no": [], "ref_date": [], "batch_id": []}
     for field in ["name", "id_no", "ref_date", "batch_id"]:
         if not per_field_label_presence[field]:
-            report[field].append("文件中未找到該欄位標籤（含模糊）。")
+            report[field].append("未找到標籤")
         else:
             if not all_cands[field]:
-                report[field].append("找到標籤，但附近沒有合格候選。")
+                report[field].append("有標籤但無候選")
             else:
-                report[field].append(f"找到標籤與候選 {len(all_cands[field])} 條。")
+                report[field].append(f"候選 {len(all_cands[field])} 條")
 
-    return {
-        "records": minimal_records,
-        "report": report  # 如不需要可移除
-    }
+    return {"records": minimal_records, "report": report}
 
 def extract_minimal_from_file(txt_path: str, surname_txt_path: Optional[str]) -> Dict:
     with open(txt_path, "r", encoding="utf-8") as f:
@@ -558,14 +564,14 @@ def extract_minimal_from_file(txt_path: str, surname_txt_path: Optional[str]) ->
     return extract_minimal_from_text(text, surname_txt_path)
 
 # ==============================
-# CLI (single file or batch folder)
+# CLI (single or batch)
 # ==============================
 def main(argv: List[str]) -> None:
     import argparse
-    ap = argparse.ArgumentParser(description="Rule-based TXT extractor (minimal output: value, confidence, context10) with batch folder support")
-    ap.add_argument("txt", nargs="?", help="Input .txt file path (omit if using --input_dir)")
-    ap.add_argument("--input_dir", help="Directory containing .txt files to process", default=None)
-    ap.add_argument("--surnames", help="Path to comma-separated surnames txt (no newline)", default=None)
+    ap = argparse.ArgumentParser(description="TXT extractor (unified scoring, minimal output) with batch support")
+    ap.add_argument("txt", nargs="?", help="Input .txt file (omit if using --input_dir)")
+    ap.add_argument("--input_dir", help="Directory containing .txt files", default=None)
+    ap.add_argument("--surnames", help="Comma-separated surnames txt", default=None)
     ap.add_argument("--output", "-o", help="Output JSON path (default: stdout)", default=None)
     args = ap.parse_args(argv)
 
