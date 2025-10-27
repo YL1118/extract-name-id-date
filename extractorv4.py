@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 Rule-based multi-record extractor for TXT documents (Taiwanese admin-style docs)
-Unified scoring + Batch + Minimal output
+Unified scoring + Batch + Minimal output + Name blacklist
 
 Minimal output per field:
 - value
@@ -63,6 +63,17 @@ BIGRAM_BLACKLIST = {"應於","基準","查詢","調查","名單","身分","證�
 ENABLE_DYNAMIC_DOUBLE_SURNAME = True
 ENABLE_IDLABEL_PROXIMITY = True
 IDLABEL_BONUS_SCALE = 1.0
+
+# ===== Name value blacklist =====
+# 完整比對與子字串比對皆可開關
+NAME_VALUE_BLACKLIST = {
+    "未知", "測試", "樣本", "例子",
+    "公司", "股份有限公司", "銀行", "事業部",
+    "會計", "課長", "主任", "助理", "經理",
+    "代理人", "負責人", "管理員", "代表人",
+    "單位", "股", "科", "處", "部", "隊", "室"
+}
+NAME_BLACKLIST_SUBSTRING = True  # True: 只要含有黑名單任一詞就排除；False: 需完整等於才排除
 
 # Batch ID
 RE_BATCH_13 = re.compile(r"\b\d{13}\b")
@@ -306,6 +317,14 @@ def name_candidates_from_text(line_text: str, surname_singles: Set[str], surname
     return cands
 
 # ==============================
+# Blacklist helper
+# ==============================
+def is_name_blacklisted(name_value: str) -> bool:
+    if NAME_BLACKLIST_SUBSTRING:
+        return any(bad in name_value for bad in NAME_VALUE_BLACKLIST)
+    return name_value in NAME_VALUE_BLACKLIST
+
+# ==============================
 # Candidate discovery
 # ==============================
 def find_field_candidates_around_label(field: str, label: LabelHit, lines: List[str], surname_singles: Set[str], surname_doubles: Set[str]) -> List[Candidate]:
@@ -313,6 +332,10 @@ def find_field_candidates_around_label(field: str, label: LabelHit, lines: List[
     label_line_text = lines[label.line]
 
     def add_candidate(value: str, vcol: int, line: int, dir_key: str, fmt_conf: float) -> None:
+        # 黑名單過濾（完整或子字串）
+        if field == "name" and is_name_blacklisted(value):
+            return
+
         line_delta = line - label.line
         col_delta = abs(vcol - label.col)
         dist = distance_score(label.col, vcol, line_delta)
@@ -498,13 +521,15 @@ def extract_minimal_from_text(text: str, surname_txt_path: Optional[str] = None)
     for h in label_hits:
         all_cands[h.field].extend(find_field_candidates_around_label(h.field, h, lines, surname_singles, surname_doubles))
 
-    # 2.5) 若沒姓名候選但有ID → 用ID附近補抓姓名
+    # 2.5) 若沒姓名候選但有ID → 用ID附近補抓姓名（同時套用黑名單）
     if (not per_field_label_presence["name"] or not all_cands["name"]) and all_cands["id_no"]:
         for idc in all_cands["id_no"]:
             for dl in range(0, MAX_DOWN_LINES + 1):
                 li = idc.line + dl
                 if li >= len(lines): break
                 for name, col in name_candidates_from_text(lines[li], surname_singles, surname_doubles):
+                    if is_name_blacklisted(name):
+                        continue
                     dist = distance_score(idc.col, col, li - idc.line)
                     all_cands["name"].append(Candidate(
                         field="name", value=name, line=li, col=col,
@@ -514,7 +539,7 @@ def extract_minimal_from_text(text: str, surname_txt_path: Optional[str] = None)
                         context_bonus=0.2
                     ))
 
-    # 2.7) 姓名距 ID 標籤加分（寫進 context_bonus，仍屬 base score 一部分）
+    # 2.7) 姓名距 ID 標籤加分（寫進 context_bonus，屬 base score 一部分）
     if ENABLE_IDLABEL_PROXIMITY:
         id_label_positions: List[Tuple[int,int]] = [(h.line, h.col) for h in label_hits if h.field == "id_no"]
         if id_label_positions:
@@ -568,7 +593,7 @@ def extract_minimal_from_file(txt_path: str, surname_txt_path: Optional[str]) ->
 # ==============================
 def main(argv: List[str]) -> None:
     import argparse
-    ap = argparse.ArgumentParser(description="TXT extractor (unified scoring, minimal output) with batch support")
+    ap = argparse.ArgumentParser(description="TXT extractor (unified scoring, minimal output, name blacklist) with batch support")
     ap.add_argument("txt", nargs="?", help="Input .txt file (omit if using --input_dir)")
     ap.add_argument("--input_dir", help="Directory containing .txt files", default=None)
     ap.add_argument("--surnames", help="Comma-separated surnames txt", default=None)
